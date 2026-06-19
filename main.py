@@ -3,35 +3,52 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from enum import Enum
 from fractions import Fraction
+from functools import lru_cache
 from typing import Final, Literal, Optional
 
 import logging
 
 from fastapi import APIRouter, FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 # ============================================================
 # Constants
 # ============================================================
 
-SERVICE_NAME: Final[str] = "Golden Digital Root API"
-API_VERSION: Final[str] = "2.0.0"
-THEORY_VERSION: Final[str] = "1.0.0"
+SERVICE_NAME:   Final[str]            = "Numera Engine"
+API_VERSION:    Final[str]            = "2.2.0"
+THEORY_VERSION: Final[str]            = "1.0.0"
 
-MAX_ABS: Final[int] = 10**9
-MAX_BATCH_SIZE: Final[int] = 50
+MAX_ABS:        Final[int]            = 10**9
+MAX_BATCH_SIZE: Final[int]            = 50
 
-GoldenNumber = Literal[3, 6, 9]
+InvariantCoefficient = Literal[3, 6, 9]
 
-INVERTED_DR: Final[dict[int, int]] = {3: 6, 6: 3, 9: 9}
+INVERTED_DR:    Final[dict[int, int]] = {3: 6, 6: 3, 9: 9}
+
+# Add your production frontend domain to this tuple before deploying,
+# e.g. "https://your-frontend.com"
+ALLOWED_ORIGINS: Final[tuple[str, ...]] = (
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+)
+
+MATRIX_LIMIT: Final[str] = "30/minute"
+BATCH_LIMIT:  Final[str] = "10/minute"
 
 # ============================================================
 # Logging
 # ============================================================
 
-logger = logging.getLogger("gdr")
+logger = logging.getLogger("numera")
 if not logger.handlers:
     handler = logging.StreamHandler()
     handler.setFormatter(
@@ -40,6 +57,12 @@ if not logger.handlers:
     logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 logger.propagate = False
+
+# ============================================================
+# Rate Limiter
+# ============================================================
+
+limiter = Limiter(key_func=get_remote_address)
 
 # ============================================================
 # App Lifespan
@@ -51,39 +74,29 @@ async def lifespan(app: FastAPI):
     yield
     logger.info("%s shutting down", SERVICE_NAME)
 
+
 app = FastAPI(
     lifespan=lifespan,
     title=SERVICE_NAME,
-    description="""
-Evaluates and verifies the Golden Digital Root (GDR) equation:
-
-Ng1 × (1 + Ng2 × n)
-
-Golden numbers (Ng1, Ng2): 3, 6, or 9.
-
-Definition (Fractional Digital Root)
-
-Let x be a terminating decimal.
-
-Let k be the smallest non-negative integer such that:
-
-x × 10^k
-
-is an integer.
-
-Then:
-
-GDR(x) = DR(x × 10^k)
-
-Examples:
-
-7.5   → 75   → DR = 3
-0.375 → 375  → DR = 6
-""".strip(),
+    description="Numera Engine — Invariant Digital Root evaluation service.",
     version=API_VERSION,
+    docs_url=None,   # Fix 1: public docs disabled to protect the equation
+    redoc_url=None,
 )
 
-router = APIRouter(prefix="/api/v1", tags=["GDR Engine"])
+# Fix 4: use only the exception handler pattern — SlowAPIMiddleware conflicts with it
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=list(ALLOWED_ORIGINS),
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+    allow_credentials=False,
+)
+
+router = APIRouter(prefix="/api/v1", tags=["Numera Engine"])
 
 # ============================================================
 # Error Codes
@@ -101,14 +114,14 @@ class ErrorCode(str, Enum):
 class MatrixRequest(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    ng1: GoldenNumber = Field(
+    alpha: InvariantCoefficient = Field(
         ...,
-        description="Primary golden number. Must be 3, 6, or 9.",
+        description="Primary Invariant Coefficient (α). Determines the output digital root. Must be 3, 6, or 9.",
         json_schema_extra={"example": 3},
     )
-    ng2: GoldenNumber = Field(
+    beta: InvariantCoefficient = Field(
         ...,
-        description="Secondary golden number. Must be 3, 6, or 9.",
+        description="Secondary Invariant Coefficient (β). Must be 3, 6, or 9.",
         json_schema_extra={"example": 6},
     )
     numerator: int = Field(
@@ -134,14 +147,14 @@ class BatchRequest(BaseModel):
         ...,
         min_length=1,
         max_length=MAX_BATCH_SIZE,
-        description=f"Up to {MAX_BATCH_SIZE} independent GDR evaluations.",
+        description=f"Up to {MAX_BATCH_SIZE} independent IDR evaluations.",
     )
 
 
 class MatrixState(str, Enum):
     INVALID_FRACTION_INFINITE_DECIMALS = "INVALID_FRACTION_INFINITE_DECIMALS"
     SPECIAL_CASE_ZERO_STATE            = "SPECIAL_CASE_ZERO_STATE"
-    VALID_ZERO_STATE                   = "VALID_ZERO_STATE"
+    VALID_INTEGER_NONNEGATIVE          = "VALID_INTEGER_NONNEGATIVE"
     VALID_INTEGER_POSITIVE             = "VALID_INTEGER_POSITIVE"
     VALID_INTEGER_NEGATIVE             = "VALID_INTEGER_NEGATIVE"
     VALID_FRACTION_POSITIVE            = "VALID_FRACTION_POSITIVE"
@@ -154,8 +167,7 @@ class MatrixResponse(BaseModel):
     n_state:                 MatrixState
     n_value:                 Optional[str]       = None
     zero_crossing_threshold: Optional[str]       = None
-    equation:                Optional[str]       = None
-    mathematical_result:     Optional[str]       = None
+    mathematical_result:     Optional[str]       = None  # Fix 3: equation field removed
     calculated_digital_root: Optional[int]       = None
     expected_digital_root:   Optional[int]       = None
     logic_verified:          Optional[bool]      = None
@@ -173,6 +185,7 @@ class BatchResponse(BaseModel):
     total:          int
     api_version:    str = API_VERSION
     theory_version: str = THEORY_VERSION
+
 
 # ============================================================
 # Exception Handlers
@@ -205,6 +218,7 @@ async def unexpected_exception_handler(request: Request, exc: Exception) -> JSON
         },
     )
 
+
 # ============================================================
 # Utility Functions
 # ============================================================
@@ -215,6 +229,7 @@ def digital_root(value: int) -> int:
     return 0 if value == 0 else 1 + ((value - 1) % 9)
 
 
+@lru_cache(maxsize=4096)
 def analyze_denominator(denominator: int) -> tuple[bool, int, Optional[int]]:
     """
     Returns:
@@ -244,9 +259,9 @@ def analyze_denominator(denominator: int) -> tuple[bool, int, Optional[int]]:
     return False, max(p, q), d
 
 
-def golden_digital_root(value: Fraction) -> int:
+def invariant_digital_root(value: Fraction) -> int:
     """
-    Golden Digital Root of a terminating Fraction.
+    Invariant Digital Root of a terminating Fraction.
 
     Example:
         15/2 = 7.5
@@ -258,17 +273,12 @@ def golden_digital_root(value: Fraction) -> int:
     if not is_terminating:
         raise ValueError(f"{value} is not a terminating decimal.")
 
-    scaled_integer = abs(value.numerator) * (10**scale) // value.denominator
+    scaled_integer = abs(value.numerator) * (10 ** scale) // value.denominator
     return digital_root(scaled_integer)
 
 
-def fmt_equation(ng1: int, ng2: int, n: Fraction, result: Fraction) -> str:
-    """Readable equation string."""
-    return f"{ng1} × (1 + {ng2} × {n}) = {result}"
-
-
 def classify_state_and_expected_dr(
-    ng1: int,
+    alpha: int,
     n: Fraction,
     threshold: Fraction,
 ) -> tuple[MatrixState, int, str]:
@@ -277,55 +287,56 @@ def classify_state_and_expected_dr(
 
     if n == 0:
         return (
-            MatrixState.VALID_ZERO_STATE,
-            ng1,
-            "n is exactly zero. Digital root maps directly to ng1.",
+            MatrixState.VALID_INTEGER_NONNEGATIVE,
+            alpha,
+            "n is exactly zero. Digital root maps directly to α.",
         )
 
     if n > 0:
         state = MatrixState.VALID_INTEGER_POSITIVE if is_integer else MatrixState.VALID_FRACTION_POSITIVE
-        return state, ng1, "n is positive. Digital root maps directly to ng1."
+        return state, alpha, "n is positive. Digital root maps directly to α."
 
     state = MatrixState.VALID_INTEGER_NEGATIVE if is_integer else MatrixState.VALID_FRACTION_NEGATIVE
 
     if n > threshold:
         return (
             state,
-            ng1,
-            "n is negative but above the zero-crossing threshold. Result remains positive; digital root maps to ng1.",
+            alpha,
+            "n is negative but above the zero-crossing threshold. Result remains positive; digital root maps to α.",
         )
 
     return (
         state,
-        INVERTED_DR[ng1],
+        INVERTED_DR[alpha],
         "n is negative and below the zero-crossing threshold. Result is negative; digital root follows INVERTED_DR.",
     )
+
 
 # ============================================================
 # Core Engine
 # ============================================================
 
-def evaluate_gdr(ng1: int, ng2: int, numerator: int, denominator: int) -> MatrixResponse:
-    """Pure business logic for the Golden Digital Root theory."""
-    n = Fraction(numerator, denominator)
-    threshold = Fraction(-1, ng2)
+@lru_cache(maxsize=512)
+def evaluate_idr(alpha: int, beta: int, numerator: int, denominator: int) -> MatrixResponse:
+    """Pure business logic for the Invariant Digital Root theory."""
+    n         = Fraction(numerator, denominator)
+    threshold = Fraction(-1, beta)
 
     logger.debug(
-        "Evaluating GDR | ng1=%s ng2=%s numerator=%s denominator=%s n=%s",
-        ng1, ng2, numerator, denominator, n,
+        "Evaluating IDR | alpha=%s beta=%s numerator=%s denominator=%s n=%s",
+        alpha, beta, numerator, denominator, n,
     )
 
     if n == threshold:
         return MatrixResponse(
-            n_state=MatrixState.SPECIAL_CASE_ZERO_STATE,
-            n_value=str(n),
-            zero_crossing_threshold=str(threshold),
-            equation=fmt_equation(ng1, ng2, n, Fraction(0)),
-            mathematical_result="0",
-            calculated_digital_root=0,
-            expected_digital_root=0,
-            logic_verified=True,
-            message=f"n equals the zero-crossing threshold (-1/{ng2}). Result is 0.",
+            n_state                 = MatrixState.SPECIAL_CASE_ZERO_STATE,
+            n_value                 = str(n),
+            zero_crossing_threshold = str(threshold),
+            mathematical_result     = "0",
+            calculated_digital_root = 0,
+            expected_digital_root   = 0,
+            logic_verified          = True,
+            message = f"n equals the zero-crossing threshold (-1/{beta}). Result is 0.",
         )
 
     is_terminating, _, offending_prime = analyze_denominator(n.denominator)
@@ -333,38 +344,38 @@ def evaluate_gdr(ng1: int, ng2: int, numerator: int, denominator: int) -> Matrix
     if not is_terminating:
         logger.info("Non-terminating input rejected | n=%s offending_prime=%s", n, offending_prime)
         return MatrixResponse(
-            n_state=MatrixState.INVALID_FRACTION_INFINITE_DECIMALS,
-            n_value=str(n),
-            zero_crossing_threshold=str(threshold),
-            error_code=ErrorCode.NON_TERMINATING_DECIMAL,
-            message=(
+            n_state                 = MatrixState.INVALID_FRACTION_INFINITE_DECIMALS,
+            n_value                 = str(n),
+            zero_crossing_threshold = str(threshold),
+            error_code              = ErrorCode.NON_TERMINATING_DECIMAL,
+            message = (
                 f"Denominator contains prime factor {offending_prime} "
                 f"(not 2 or 5), producing a non-terminating decimal."
             ),
         )
 
-    result = Fraction(ng1) * (1 + Fraction(ng2) * n)
-    actual_dr = golden_digital_root(result)
-    state, expected_dr, note = classify_state_and_expected_dr(ng1, n, threshold)
+    result    = Fraction(alpha) * (1 + Fraction(beta) * n)
+    actual_dr = invariant_digital_root(result)
+    state, expected_dr, note = classify_state_and_expected_dr(alpha, n, threshold)
 
     verified = actual_dr == expected_dr
 
-    logger.info(
-        "GDR evaluation complete | n=%s result=%s actual_dr=%s expected_dr=%s verified=%s",
+    logger.info(  # Fix 2: restored to INFO — carries verified result operators need to see
+        "IDR evaluation complete | n=%s result=%s actual_dr=%s expected_dr=%s verified=%s",
         n, result, actual_dr, expected_dr, verified,
     )
 
     return MatrixResponse(
-        n_state=state,
-        n_value=str(n),
-        zero_crossing_threshold=str(threshold),
-        equation=fmt_equation(ng1, ng2, n, result),
-        mathematical_result=str(result),
-        calculated_digital_root=actual_dr,
-        expected_digital_root=expected_dr,
-        logic_verified=verified,
-        note=note,
+        n_state                 = state,
+        n_value                 = str(n),
+        zero_crossing_threshold = str(threshold),
+        mathematical_result     = str(result),
+        calculated_digital_root = actual_dr,
+        expected_digital_root   = expected_dr,
+        logic_verified          = verified,
+        note                    = note,
     )
+
 
 # ============================================================
 # Endpoints
@@ -373,17 +384,22 @@ def evaluate_gdr(ng1: int, ng2: int, numerator: int, denominator: int) -> Matrix
 @app.get("/health", status_code=status.HTTP_200_OK, tags=["System"])
 def health_check():
     return {
-        "status": "operational",
-        "api_version": API_VERSION,
+        "status":         "operational",
+        "api_version":    API_VERSION,
         "theory_version": THEORY_VERSION,
     }
+
+
+@app.get("/ping", status_code=status.HTTP_200_OK, tags=["System"])
+def ping():
+    return {"ping": "pong"}
 
 
 @app.get("/", include_in_schema=False)
 def root():
     return {
-        "service": SERVICE_NAME,
-        "api_version": API_VERSION,
+        "service":        SERVICE_NAME,
+        "api_version":    API_VERSION,
         "theory_version": THEORY_VERSION,
     }
 
@@ -393,14 +409,15 @@ def root():
     response_model=MatrixResponse,
     response_model_exclude_none=True,
     status_code=status.HTTP_200_OK,
-    summary="Evaluate a single GDR expression",
+    summary="Evaluate a single IDR expression",
 )
-def evaluate_matrix(request: MatrixRequest) -> MatrixResponse:
-    return evaluate_gdr(
-        ng1=request.ng1,
-        ng2=request.ng2,
-        numerator=request.numerator,
-        denominator=request.denominator,
+@limiter.limit(MATRIX_LIMIT)
+def evaluate_matrix(request: Request, payload: MatrixRequest) -> MatrixResponse:
+    return evaluate_idr(
+        alpha       = payload.alpha,
+        beta        = payload.beta,
+        numerator   = payload.numerator,
+        denominator = payload.denominator,
     )
 
 
@@ -409,17 +426,18 @@ def evaluate_matrix(request: MatrixRequest) -> MatrixResponse:
     response_model=BatchResponse,
     response_model_exclude_none=True,
     status_code=status.HTTP_200_OK,
-    summary=f"Evaluate up to {MAX_BATCH_SIZE} GDR expressions in one request",
+    summary=f"Evaluate up to {MAX_BATCH_SIZE} IDR expressions in one request",
 )
-def evaluate_matrix_batch(request: BatchRequest) -> BatchResponse:
+@limiter.limit(BATCH_LIMIT)
+def evaluate_matrix_batch(request: Request, payload: BatchRequest) -> BatchResponse:
     results = tuple(
-        evaluate_gdr(
-            ng1=item.ng1,
-            ng2=item.ng2,
-            numerator=item.numerator,
-            denominator=item.denominator,
+        evaluate_idr(
+            alpha       = item.alpha,
+            beta        = item.beta,
+            numerator   = item.numerator,
+            denominator = item.denominator,
         )
-        for item in request.evaluations
+        for item in payload.evaluations
     )
     return BatchResponse(results=results, total=len(results))
 
@@ -428,5 +446,4 @@ app.include_router(router)
 
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
